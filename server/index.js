@@ -1,9 +1,9 @@
 // ===============================================================
 //  KALI NEXUS — Real Backend Server (Render Ready)
-//  - node-pty for real PTY terminals
+//  - Tries node-pty first (real PTY terminal)
+//  - Falls back to child_process.spawn with -i if pty unavailable
 //  - Helmet security + rate limiting
 //  - Hardened command filter
-//  - Metasploit + Wireshark (tshark) live streams
 // ===============================================================
 import express from 'express';
 import cors from 'cors';
@@ -27,7 +27,7 @@ const PORT = process.env.PORT || 3001;
 
 // ============== MIDDLEWARE ==============
 app.use(helmet({
-  contentSecurityPolicy: false, // SPA needs inline scripts/styles
+  contentSecurityPolicy: false,
   crossOriginEmbedderPolicy: false,
   crossOriginOpenerPolicy: false,
 }));
@@ -46,13 +46,13 @@ app.use('/api/', limiter);
 
 // ============== SECURITY: COMMAND FILTER ==============
 const FORBIDDEN_PATTERNS = [
-  /rm\s+-rf\s+\/(?!tmp)/,         // rm -rf / but allow /tmp
-  /rm\s+-rf\s+\/\*/,              // rm -rf /*
-  /mkfs/,                          // mkfs
-  /dd\s+if=.*of=\/dev\//,         // dd if=... of=/dev/...
-  /:\s*\(\s*\)\s*\{/,             // fork bomb :(){ :|:& };:
+  /rm\s+-rf\s+\/(?!tmp)/,
+  /rm\s+-rf\s+\/\*/,
+  /mkfs/,
+  /dd\s+if=.*of=\/dev\//,
+  /:\s*\(\s*\)\s*\{/,
   /\bsync.*;\s*echo\s+3\s*>\s*\/proc\/sys\/vm\/drop_caches/,
-  />\s*\/dev\/sd[a-z]/,          // write to disk devices
+  />\s*\/dev\/sd[a-z]/,
   />\s*\/dev\/nvme/,
   /shutdown/,
   /reboot/,
@@ -67,7 +67,7 @@ const FORBIDDEN_PATTERNS = [
   /\/etc\/shadow/,
   /passwd\s+root/,
   /usermod.*-p.*root/,
-  /\bcurl\s+.*\|\s*sh/,           // curl | sh (remote code exec)
+  /\bcurl\s+.*\|\s*sh/,
   /\bwget\s+.*\|\s*sh/,
   /\bnpm\s+install\s+-g.*&&.*rm/,
 ];
@@ -82,7 +82,7 @@ const isCommandForbidden = (cmd) => {
 
 // ============== HEALTH ==============
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime(), platform: os.platform(), pty: 'node-pty' });
+  res.json({ status: 'ok', uptime: process.uptime(), platform: os.platform(), pty: ptyModule ? 'node-pty' : 'spawn-fallback' });
 });
 
 // ============== SYSTEM INFO ==============
@@ -124,7 +124,6 @@ app.get('/api/system', async (req, res) => {
       isRoot = stdout.trim() === '0';
     } catch (e) {}
 
-    // Check which tools are installed
     const tools = {};
     for (const tool of ['nmap', 'msfconsole', 'tshark', 'tcpdump', 'python3', 'curl', 'sqlmap', 'nikto', 'gobuster', 'hydra', 'john', 'hashcat']) {
       try {
@@ -301,7 +300,6 @@ const distPath = path.join(__dirname, '../dist');
 if (fs.existsSync(distPath)) {
   console.log(`[Server] Serving frontend from ${distPath}`);
   app.use(express.static(distPath));
-  // SPA fallback — Express 5 uses named params, '*' alone is invalid
   app.get('/{*splat}', (req, res) => {
     if (req.path.startsWith('/api') || req.path.startsWith('/terminal') || req.path.startsWith('/metasploit') || req.path.startsWith('/wireshark') || req.path.startsWith('/health')) {
       return res.status(404).json({ error: 'Not found' });
@@ -323,7 +321,7 @@ server.listen(PORT, '0.0.0.0', () => {
 ║   KALI NEXUS BACKEND • ACTIVE             ║
 ╠════════════════════════════════════════════╣
 ║  Port:        ${String(PORT).padEnd(28)} ║
-║  PTY:         node-pty (real shell)       ║
+║  PTY:         ${ptyModule ? 'node-pty (real shell)'.padEnd(28) : 'spawn-fallback'.padEnd(28)} ║
 ║  WS:          /terminal  /metasploit      ║
 ║               /wireshark                  ║
 ║  Platform:    ${os.platform().padEnd(28)} ║
@@ -333,22 +331,30 @@ server.listen(PORT, '0.0.0.0', () => {
   `);
 });
 
-// ============== WEBSOCKET: REAL TERMINAL (node-pty) ==============
+// ============== LOAD node-pty (OPTIONAL) ==============
 let ptyModule = null;
 try {
   ptyModule = await import('node-pty');
-  console.log('[PTY] node-pty loaded ✓');
+  // Test it actually works
+  const testPty = ptyModule.spawn('/bin/echo', ['pty_test'], { name: 'xterm-256color', cols: 80, rows: 24 });
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { try { testPty.kill(); } catch(e) {}; resolve(); }, 1000);
+    testPty.onExit(() => { clearTimeout(timer); resolve(); });
+  });
+  console.log('[PTY] node-pty loaded and verified ✓');
 } catch (e) {
-  console.warn('[PTY] node-pty not available — falling back to child_process spawn');
+  ptyModule = null;
+  console.warn('[PTY] node-pty not available — using spawn fallback');
   console.warn('[PTY] Reason:', e.message);
 }
 
+// ============== WEBSOCKET: REAL TERMINAL ==============
 const wssTerminal = new WebSocketServer({ server, path: '/terminal', perMessageDeflate: false });
 
 wssTerminal.on('connection', (ws) => {
   console.log('[Terminal] Client connected');
   const isWin = os.platform() === 'win32';
-  const shell = isWin ? 'powershell.exe' : (process.env.SHELL || '/bin/bash');
+  const shell = isWin ? 'powershell.exe' : (process.env.SHELL || '/bin/bash' || 'sh');
 
   let ptyProcess = null;
   let spawnProcess = null;
@@ -359,18 +365,15 @@ wssTerminal.on('connection', (ws) => {
       if (alive) {
         ws.send(typeof data === 'string' ? data : data.toString(), { binary: false });
       }
-    } catch (e) {
-      console.error('[Terminal] send error:', e.message);
-    }
+    } catch (e) {}
   };
 
-  const welcome = `\r\n\x1b[32m╔════════════════════════════════════════╗\r\n║   🐉 KALI NEXUS — REAL PTY SHELL      ║\r\n╚════════════════════════════════════════╝\x1b[0m\r\n` +
+  const welcome = `\r\n\x1b[32m╔════════════════════════════════════════╗\r\n║   🐉 KALI NEXUS — REAL SHELL           ║\r\n╚════════════════════════════════════════╝\x1b[0m\r\n` +
     `\r\nHost: ${os.hostname()} • ${os.platform()} ${os.release()}\r\n` +
     `User: ${os.userInfo().username} • Shell: ${shell}\r\n` +
     `Cwd:  ${os.homedir()}\r\n\r\n`;
 
   if (ptyModule) {
-    // ============ REAL PTY MODE ============
     try {
       ptyProcess = ptyModule.spawn(shell, [], {
         name: 'xterm-256color',
@@ -387,7 +390,6 @@ wssTerminal.on('connection', (ws) => {
       ws.on('message', (msg) => {
         try {
           const text = msg.toString();
-          // Handle resize messages: special JSON {type:"resize",cols,rows}
           if (text.startsWith('\x1b[__resize__')) {
             const m = text.match(/cols=(\d+);rows=(\d+)/);
             if (m && ptyProcess) {
@@ -417,25 +419,33 @@ wssTerminal.on('connection', (ws) => {
   }
 
   // ============ FALLBACK: child_process spawn ============
-  send(welcome + `\x1b[33m[fallback mode — limited interactive support]\x1b[0m\r\n`);
-  send(`\x1b[32m${os.userInfo().username}@${os.hostname()}\x1b[0m:\x1b[34m~\x1b[0m# `);
+  send(welcome + `\x1b[33m[spawn fallback mode — basic interactive shell]\x1b[0m\r\n`);
+  send(`\x1b[90m[vim/top may not work in fallback mode]\x1b[0m\r\n\r\n`);
 
-  spawnProcess = spawn(shell, ['-i'], {
-    env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', PS1: '\\u@\\h:\\w# ' },
-    cwd: os.homedir(),
-  });
+  try {
+    spawnProcess = spawn(shell, ['-i'], {
+      env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', PS1: '\\u@\\h:\\w# ' },
+      cwd: os.homedir(),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
 
-  spawnProcess.stdout.on('data', (data) => send(data.toString()));
-  spawnProcess.stderr.on('data', (data) => send(data.toString()));
-  ws.on('message', (msg) => {
-    try { spawnProcess.stdin.write(msg.toString()); } catch (e) {}
-  });
-  ws.on('close', () => {
-    alive = false;
-    try { spawnProcess && spawnProcess.kill(); } catch (e) {}
-    console.log('[Terminal] Client disconnected (spawn)');
-  });
-  spawnProcess.on('exit', () => { try { if (alive) ws.close(); } catch (e) {} });
+    spawnProcess.stdout.on('data', (data) => send(data.toString()));
+    spawnProcess.stderr.on('data', (data) => send(data.toString()));
+    ws.on('message', (msg) => {
+      try { spawnProcess.stdin.write(msg.toString()); } catch (e) {}
+    });
+    ws.on('close', () => {
+      alive = false;
+      try { spawnProcess && spawnProcess.kill(); } catch (e) {}
+      console.log('[Terminal] Client disconnected (spawn)');
+    });
+    spawnProcess.on('exit', () => { try { if (alive) ws.close(); } catch (e) {} });
+    spawnProcess.on('error', (err) => {
+      send(`\r\n\x1b[31m[shell error: ${err.message}]\x1b[0m\r\n`);
+    });
+  } catch (e) {
+    send(`\r\n\x1b[31m[Failed to start shell: ${e.message}]\x1b[0m\r\n`);
+  }
 });
 
 // ============== WEBSOCKET: METASPLOIT CONSOLE ==============
@@ -444,16 +454,18 @@ const wssMsf = new WebSocketServer({ server, path: '/metasploit', perMessageDefl
 wssMsf.on('connection', (ws) => {
   console.log('[Metasploit] Client connected');
   let alive = true;
-  const send = (data) => { try { if (alive) ws.send(data); } catch (e) {} };
+  const send = (data) => { try { if (alive) ws.send(typeof data === 'string' ? data : data.toString(), { binary: false }); } catch (e) {} };
 
   send('\x1b[33m[*] Launching Metasploit Framework Console...\x1b[0m\r\n');
-  send('\x1b[90m[this may take 10-30 seconds on first run]\x1b[0m\r\n\r\n');
+  send('\x1b[90m[this may take 10-30 seconds on first run]\x1b[0m\r\n');
+  send('\x1b[90m[if msfconsole is not installed, install with: apt install metasploit-framework]\x1b[0m\r\n\r\n');
 
   let msfProcess = null;
   try {
     msfProcess = spawn('msfconsole', ['-q'], {
       env: { ...process.env, TERM: 'xterm-256color' },
       cwd: os.homedir(),
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
 
     msfProcess.stdout.on('data', (data) => send(data.toString()));
@@ -472,7 +484,13 @@ wssMsf.on('connection', (ws) => {
 
     msfProcess.on('exit', (code) => {
       send(`\r\n\x1b[33m[*] Metasploit exited with code ${code}\x1b[0m\r\n`);
+      send(`\x1b[90m[If msfconsole is not installed, run: apt install metasploit-framework]\x1b[0m\r\n`);
       try { if (alive) ws.close(); } catch (e) {}
+    });
+
+    msfProcess.on('error', (err) => {
+      send(`\r\n\x1b[31m[!] msfconsole not found: ${err.message}\x1b[0m\r\n`);
+      send(`\x1b[90m[Install with: apt install metasploit-framework]\x1b[0m\r\n`);
     });
   } catch (e) {
     send(`\x1b[31m[!] Failed to start msfconsole: ${e.message}\x1b[0m\r\n`);
@@ -487,10 +505,11 @@ wssShark.on('connection', (ws) => {
   console.log('[Wireshark] Client connected');
   let alive = true;
   let tsharkProcess = null;
-  const send = (data) => { try { if (alive) ws.send(data); } catch (e) {} };
+  const send = (data) => { try { if (alive) ws.send(typeof data === 'string' ? data : data.toString(), { binary: false }); } catch (e) {} };
 
   const startCapture = (iface = 'any', filter = '') => {
     send(`\x1b[33m[*] Starting tshark on ${iface}${filter ? ' filter: ' + filter : ''}\x1b[0m\r\n`);
+    send(`\x1b[90m[if tshark is not installed, install with: apt install tshark]\x1b[0m\r\n`);
     const args = ['-l', '-i', iface, '-T', 'fields',
       '-e', 'frame.number', '-e', 'frame.time_relative',
       '-e', 'ip.src', '-e', 'ip.dst', '-e', '_ws.col.Protocol',
@@ -498,7 +517,7 @@ wssShark.on('connection', (ws) => {
     if (filter) args.push('-f', filter);
 
     try {
-      tsharkProcess = spawn('tshark', args, { env: process.env });
+      tsharkProcess = spawn('tshark', args, { env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
       tsharkProcess.stdout.on('data', (data) => {
         const lines = data.toString().split('\n').filter(l => l.trim());
         for (const line of lines) {
@@ -521,6 +540,9 @@ wssShark.on('connection', (ws) => {
       tsharkProcess.on('exit', (code) => {
         send(JSON.stringify({ type: 'exit', code }) + '\n');
       });
+      tsharkProcess.on('error', (err) => {
+        send(JSON.stringify({ type: 'error', text: err.message }) + '\n');
+      });
     } catch (e) {
       send(JSON.stringify({ type: 'error', text: e.message }) + '\n');
     }
@@ -533,9 +555,7 @@ wssShark.on('connection', (ws) => {
       else if (data.type === 'stop') {
         try { tsharkProcess && tsharkProcess.kill('SIGINT'); } catch (e) {}
       }
-    } catch (e) {
-      // Not JSON, ignore
-    }
+    } catch (e) {}
   });
 
   ws.on('close', () => {

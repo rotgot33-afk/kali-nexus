@@ -2,9 +2,7 @@ FROM node:20-slim
 
 WORKDIR /app
 
-# Install lighter set of system dependencies (Render free tier has build time limit)
-# We skip metasploit-framework (huge) and tshark (heavy) for now — they can be installed
-# at runtime via the Real Shell if needed.
+# Minimal system dependencies for runtime (no build tools — using prebuilt node-pty or fallback)
 RUN apt-get update && apt-get install -y --no-install-recommends \
       nmap \
       python3 \
@@ -15,15 +13,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       dnsutils \
       whois \
       git \
-      build-essential \
-      python3-dev \
       ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Install node deps (node-pty will use prebuilt binaries or fallback gracefully)
 COPY package*.json ./
-RUN npm install --omit=dev || npm install
+RUN npm install --omit=dev --ignore-scripts || npm install --omit=dev
 
 COPY . .
 RUN npm run build
