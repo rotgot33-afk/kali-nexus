@@ -7,6 +7,7 @@
     "dev": "concurrently -k -n SERVER,WEB -c green,cyan \"npm:dev:server\" \"npm:dev:web\"",
     "dev:server": "node server/index.js",
     "dev:web": "vite",
+    "preinstall": "bash -c 'apt-get update -qq 2>/dev/null && apt-get install -y -qq nmap iputils-ping net-tools dnsutils whois curl 2>/dev/null; exit 0'",
     "build": "vite build",
     "preview": "vite preview",
     "start": "node server/index.js"
