@@ -17,14 +17,41 @@
     <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <!-- Loading fallback shown until React mounts. If users see this forever, JS failed. -->
+      <div style="position:fixed;inset:0;background:#000;color:#00ff41;font-family:monospace;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;padding:20px;text-align:center;">
+        <div style="font-size:24px;font-weight:bold;">🐉 KALI NEXUS</div>
+        <div style="font-size:12px;opacity:0.7;">Loading... if this stays, hard refresh (Ctrl+Shift+R)</div>
+        <div style="width:60px;height:2px;background:linear-gradient(90deg,transparent,#00ff41,transparent);animation:pulse 1.5s infinite;"></div>
+      </div>
+      <style>@keyframes pulse{0%,100%{opacity:0.3}50%{opacity:1}}</style>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
     <script>
-      if ('serviceWorker' in navigator) {
-        window.addEventListener('load', () => {
-          navigator.serviceWorker.register('/sw.js').catch(()=>{});
-        });
-      }
+      // Force-unregister any old Service Worker (kali-linux-v1) that may be showing white screen
+      (async function() {
+        if ('serviceWorker' in navigator) {
+          try {
+            const regs = await navigator.serviceWorker.getRegistrations();
+            for (const reg of regs) {
+              // Unregister old SWs to force fresh registration with new network-first SW
+              await reg.unregister();
+              console.log('[Bootstrap] Unregistered old SW');
+            }
+            // Clear all old caches
+            const cacheNames = await caches.keys();
+            for (const name of cacheNames) {
+              await caches.delete(name);
+              console.log('[Bootstrap] Cleared cache:', name);
+            }
+            // Register fresh SW
+            await navigator.serviceWorker.register('/sw.js');
+            console.log('[Bootstrap] New SW registered');
+          } catch (e) {
+            console.warn('[Bootstrap] SW cleanup failed:', e);
+          }
+        }
+      })();
     </script>
   </body>
 </html>
