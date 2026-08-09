@@ -7,7 +7,6 @@
     "dev": "concurrently -k -n SERVER,WEB -c green,cyan \"npm:dev:server\" \"npm:dev:web\"",
     "dev:server": "node server/index.js",
     "dev:web": "vite",
-    "preinstall": "bash -c 'apt-get update -qq 2>/dev/null && apt-get install -y -qq nmap iputils-ping net-tools dnsutils whois curl 2>/dev/null; exit 0'",
     "build": "vite build",
     "preview": "vite preview",
     "start": "node server/index.js"
@@ -27,6 +26,7 @@
     "helmet": "^8.0.0",
     "leva": "^0.10.1",
     "maath": "^0.10.8",
+    "node-pty": "^1.1.0-beta34",
     "postprocessing": "^6.39.4",
     "react": "19.2.6",
     "react-dom": "19.2.6",
