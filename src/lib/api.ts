@@ -1,15 +1,22 @@
 // ===============================================================
 //  Kali Nexus — API client with real backend + demo fallback
+//  Supports: Vercel (frontend) + Render (heavy compute proxy)
 // ===============================================================
 
 const getApiBase = () => {
   if (typeof window === 'undefined') return '';
   const hostname = window.location.hostname;
-  // Local dev -> backend on :3001
+
+  // 1. If VITE_RENDER_API_BASE is set (production on Vercel), use Render backend
+  const renderBase = import.meta.env.VITE_RENDER_API_BASE;
+  if (renderBase) return renderBase;
+
+  // 2. Local dev -> backend on :3001
   if (hostname === 'localhost' || hostname === '127.0.0.1') {
     return `${window.location.protocol}//${hostname}:3001`;
   }
-  // Production -> same origin
+
+  // 3. Same-origin (e.g. deployed on Render itself)
   return '';
 };
 
