@@ -561,9 +561,20 @@ wssShark.on('connection', (ws) => {
 
 // ============== SERVE FRONTEND (after WS servers attached) ==============
 const distPath = path.join(__dirname, '../dist');
+console.log(`[Server] Checking dist at: ${distPath} — exists: ${fs.existsSync(distPath)}`);
 if (fs.existsSync(distPath)) {
   console.log(`[Server] Serving frontend from ${distPath}`);
-  app.use(express.static(distPath));
+  // Serve static files with explicit index
+  app.use(express.static(distPath, {
+    index: 'index.html',
+    extensions: ['html', 'json', 'js'],
+  }));
+
+  // Explicit route for root
+  app.get('/', (req, res) => {
+    res.sendFile(path.join(distPath, 'index.html'));
+  });
+
   // SPA fallback — only for non-WS, non-API routes
   app.use((req, res, next) => {
     // Skip WS upgrade requests
@@ -571,7 +582,8 @@ if (fs.existsSync(distPath)) {
     if (req.path.startsWith('/api') || req.path.startsWith('/terminal') || req.path.startsWith('/metasploit') || req.path.startsWith('/wireshark') || req.path.startsWith('/health')) {
       return res.status(404).json({ error: 'Not found' });
     }
-    if (req.method === 'GET' && req.accepts('html')) {
+    // For any GET request, serve index.html (SPA routing)
+    if (req.method === 'GET') {
       return res.sendFile(path.join(distPath, 'index.html'));
     }
     next();
