@@ -245,6 +245,163 @@ app.post('/api/which', async (req, res) => {
   catch (error) { res.json({ success: false, path: null, error: 'Not found' }); }
 });
 
+// ============== NATIVE PORT SCANNER (fallback when nmap missing) ==============
+import net from 'net';
+import dns from 'dns/promises';
+
+const COMMON_PORTS = [
+  { port: 21, service: 'ftp' }, { port: 22, service: 'ssh' }, { port: 23, service: 'telnet' },
+  { port: 25, service: 'smtp' }, { port: 53, service: 'dns' }, { port: 80, service: 'http' },
+  { port: 110, service: 'pop3' }, { port: 143, service: 'imap' }, { port: 443, service: 'https' },
+  { port: 445, service: 'smb' }, { port: 3306, service: 'mysql' }, { port: 3389, service: 'rdp' },
+  { port: 5432, service: 'postgresql' }, { port: 6379, service: 'redis' }, { port: 8080, service: 'http-proxy' },
+  { port: 8443, service: 'https-alt' }, { port: 27017, service: 'mongodb' },
+];
+
+app.post('/api/scan', async (req, res) => {
+  const { target, ports } = req.body;
+  if (!target) return res.status(400).json({ error: 'No target' });
+  const safeTarget = target.replace(/[^a-zA-Z0-9.\-:]/g, '');
+
+  // Resolve hostname to IP
+  let ip = safeTarget;
+  try {
+    if (!/^[\d.]+$/.test(safeTarget)) {
+      const records = await dns.resolve4(safeTarget);
+      ip = records[0];
+    }
+  } catch (e) {
+    return res.json({ success: false, error: `Cannot resolve ${safeTarget}`, ip: null });
+  }
+
+  // Determine ports to scan
+  let portList = COMMON_PORTS;
+  if (ports && Array.isArray(ports) && ports.length > 0) {
+    portList = ports.filter(p => typeof p === 'number' && p > 0 && p < 65536).map(p => ({ port: p, service: 'unknown' }));
+  } else if (typeof ports === 'string' && ports.trim()) {
+    // Parse "80,443,8080-8085"
+    const parsed = [];
+    for (const part of ports.split(',')) {
+      const trimmed = part.trim();
+      if (trimmed.includes('-')) {
+        const [start, end] = trimmed.split('-').map(n => parseInt(n));
+        for (let i = start; i <= end && i <= 65535; i++) parsed.push({ port: i, service: 'unknown' });
+      } else {
+        const p = parseInt(trimmed);
+        if (p > 0 && p < 65536) {
+          const known = COMMON_PORTS.find(c => c.port === p);
+          parsed.push({ port: p, service: known?.service || 'unknown' });
+        }
+      }
+    }
+    if (parsed.length > 0) portList = parsed;
+  }
+
+  // Scan ports (concurrent, max 20 at a time)
+  const scanPort = (host, port) => new Promise((resolve) => {
+    const socket = new net.Socket();
+    socket.setTimeout(2000);
+    let done = false;
+    const finish = (state) => {
+      if (done) return;
+      done = true;
+      socket.destroy();
+      resolve({ port, state });
+    };
+    socket.on('connect', () => finish('open'));
+    socket.on('timeout', () => finish('filtered'));
+    socket.on('error', (err) => {
+      if (err.code === 'ECONNREFUSED') finish('closed');
+      else finish('filtered');
+    });
+    socket.connect(port, host);
+  });
+
+  const results = [];
+  const batchSize = 20;
+  for (let i = 0; i < portList.length; i += batchSize) {
+    const batch = portList.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map(p => scanPort(ip, p.port)));
+    results.push(...batchResults);
+  }
+
+  const openPorts = results.filter(r => r.state === 'open').map(r => ({
+    port: r.port,
+    state: r.state,
+    service: COMMON_PORTS.find(c => c.port === r.port)?.service || 'unknown',
+  }));
+
+  res.json({
+    success: true,
+    target: safeTarget,
+    ip,
+    scanned: results.length,
+    open: openPorts.length,
+    ports: results,
+    openPorts,
+  });
+});
+
+// ============== NATIVE PING (fallback when ping binary missing) ==============
+app.post('/api/ping-native', async (req, res) => {
+  const { host } = req.body;
+  if (!host) return res.status(400).json({ error: 'No host' });
+  const safeHost = host.replace(/[^a-zA-Z0-9.\-:]/g, '');
+
+  const startTime = Date.now();
+  let ip = safeHost;
+  let resolved = false;
+
+  // Resolve DNS
+  try {
+    if (!/^[\d.]+$/.test(safeHost)) {
+      const records = await dns.resolve4(safeHost);
+      ip = records[0];
+      resolved = true;
+    } else {
+      resolved = true;
+    }
+  } catch (e) {
+    return res.json({ success: false, host: safeHost, error: `DNS resolution failed: ${e.message}` });
+  }
+
+  // TCP "ping" — try connecting to common ports
+  const probePorts = [80, 443, 22, 8080];
+  let pingable = false;
+  let latency = 0;
+
+  for (const port of probePorts) {
+    const t0 = Date.now();
+    const reachable = await new Promise((resolve) => {
+      const socket = new net.Socket();
+      socket.setTimeout(3000);
+      let done = false;
+      const finish = (result) => { if (!done) { done = true; socket.destroy(); resolve(result); } };
+      socket.on('connect', () => finish(true));
+      socket.on('timeout', () => finish(false));
+      socket.on('error', () => finish(false));
+      socket.connect(port, ip);
+    });
+    if (reachable) {
+      pingable = true;
+      latency = Date.now() - t0;
+      break;
+    }
+  }
+
+  res.json({
+    success: pingable,
+    host: safeHost,
+    ip,
+    resolved: resolved ? `yes (${ip})` : 'no',
+    pingable,
+    latency_ms: latency,
+    method: 'tcp-probe',
+    note: pingable ? 'Host is up (TCP probe succeeded)' : 'Host appears down or filtered (no response on common ports)',
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // ============== HTTP SERVER (created BEFORE WS servers) ==============
 const server = http.createServer(app);
 

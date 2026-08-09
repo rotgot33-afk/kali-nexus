@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { runNmap } from '../../../lib/api';
+import { API_BASE } from '../../../lib/api';
 
 interface Port {
   port: number;
@@ -8,7 +9,7 @@ interface Port {
   version: string;
 }
 
-const targets = ['127.0.0.1', 'localhost', '192.168.1.1', 'scanme.nmap.org'];
+const targets = ['127.0.0.1', 'localhost', '192.168.1.1', 'scanme.nmap.org', 'example.com'];
 
 const parseNmapOutput = (output: string): Port[] => {
   const ports: Port[] = [];
@@ -43,26 +44,82 @@ export default function NmapApp() {
   const [profile, setProfile] = useState('-sV');
   const [error, setError] = useState<string | null>(null);
   const [isInstalled, setIsInstalled] = useState<boolean | null>(null);
+  const [scanMode, setScanMode] = useState<'nmap' | 'native' | null>(null);
 
   const startScan = async () => {
     setScanning(true);
     setError(null);
     setResults([]);
     setOutput('Initializing scan...\n');
+    setScanMode(null);
 
-    const res = await runNmap(target, profile);
-    setScanning(false);
-
+    // Try nmap first
+    let res = await runNmap(target, profile);
     if (res.success) {
       setOutput(res.stdout);
       setResults(parseNmapOutput(res.stdout));
       setIsInstalled(true);
-    } else {
+      setScanMode('nmap');
+      setScanning(false);
+      return;
+    }
+
+    // nmap failed — check if it's because nmap is not installed
+    const isNotInstalled = res.stderr?.includes('not found') || res.stderr?.includes('not recognized') || res.stderr?.includes('nmap not found');
+    if (!isNotInstalled) {
+      // nmap exists but scan failed for another reason
       setOutput(res.stdout || '');
       setError(res.stderr || 'Scan failed');
-      if (res.stderr?.includes('not found') || res.stderr?.includes('not recognized')) {
-        setIsInstalled(false);
+      setScanning(false);
+      return;
+    }
+
+    // Fall back to native Node.js scanner
+    setIsInstalled(false);
+    setOutput((prev) => prev + '[*] nmap not installed — using native Node.js port scanner\n');
+    setScanMode('native');
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000);
+      const scanRes = await fetch(`${API_BASE}/api/scan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      const scanData = await scanRes.json();
+
+      if (scanData.success) {
+        const nativeResults: Port[] = scanData.ports.map((p: any) => ({
+          port: p.port,
+          state: p.state,
+          service: scanData.openPorts.find((op: any) => op.port === p.port)?.service || 'unknown',
+          version: '',
+        }));
+        setResults(nativeResults);
+        setOutput((prev) =>
+          prev +
+          `\nStarting NEXUS Port Scanner (native Node.js)\n` +
+          `Target: ${scanData.target} (${scanData.ip})\n` +
+          `Scanning ${scanData.scanned} common ports...\n\n` +
+          `PORT      STATE    SERVICE\n` +
+          nativeResults
+            .filter(p => p.state === 'open')
+            .map(p => `${String(p.port).padEnd(9)} ${p.state.padEnd(8)} ${p.service}`)
+            .join('\n') +
+          `\n\n[Scan complete] ${scanData.open.length} open / ${scanData.scanned} total\n`
+        );
+      } else {
+        setError(scanData.error || 'Native scan failed');
+        setOutput((prev) => prev + `[!] ${scanData.error || 'Native scan failed'}\n`);
       }
+    } catch (e: any) {
+      setError(e.message);
+      setOutput((prev) => prev + `[!] Native scan error: ${e.message}\n`);
+    } finally {
+      setScanning(false);
     }
   };
 
