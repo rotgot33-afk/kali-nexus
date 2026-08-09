@@ -1,10 +1,11 @@
 services:
   - type: web
     name: kali-nexus
-    runtime: docker
+    env: node
     plan: free
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
+    region: oregon
+    buildCommand: npm install && npm run build
+    startCommand: node server/index.js
     healthCheckPath: /health
     autoDeploy: true
     envVars:
