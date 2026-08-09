@@ -331,17 +331,22 @@ server.listen(PORT, '0.0.0.0', () => {
   `);
 });
 
-// ============== LOAD node-pty (OPTIONAL) ==============
+// ============== LOAD node-pty (OPTIONAL — falls back to spawn) ==============
 let ptyModule = null;
 try {
-  ptyModule = await import('node-pty');
-  // Test it actually works
-  const testPty = ptyModule.spawn('/bin/echo', ['pty_test'], { name: 'xterm-256color', cols: 80, rows: 24 });
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { try { testPty.kill(); } catch(e) {}; resolve(); }, 1000);
-    testPty.onExit(() => { clearTimeout(timer); resolve(); });
-  });
-  console.log('[PTY] node-pty loaded and verified ✓');
+  // Dynamic import — if not installed, gracefully fall back
+  ptyModule = await import('node-pty').then(m => m.default || m).catch(() => null);
+  if (ptyModule) {
+    // Quick sanity test
+    const testPty = ptyModule.spawn('/bin/echo', ['pty_test'], { name: 'xterm-256color', cols: 80, rows: 24 });
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => { try { testPty.kill(); } catch(e) {}; resolve(); }, 500);
+      testPty.onExit(() => { clearTimeout(timer); resolve(); });
+    });
+    console.log('[PTY] node-pty loaded and verified ✓');
+  } else {
+    console.warn('[PTY] node-pty not installed — using spawn fallback');
+  }
 } catch (e) {
   ptyModule = null;
   console.warn('[PTY] node-pty not available — using spawn fallback');

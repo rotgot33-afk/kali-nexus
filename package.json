@@ -9,7 +9,7 @@
     "dev:web": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "start": "cross-env NODE_ENV=production node server/index.js"
+    "start": "node server/index.js"
   },
   "dependencies": {
     "@react-three/drei": "^10.7.8",
@@ -19,22 +19,16 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-web-links": "^0.12.0",
     "@xterm/xterm": "^6.0.0",
-    "concurrently": "^9.2.4",
     "cors": "^2.8.6",
-    "cross-env": "^7.0.3",
     "express": "^5.2.1",
     "express-rate-limit": "^7.4.1",
     "framer-motion": "^13.0.0",
     "helmet": "^8.0.0",
     "leva": "^0.10.1",
     "maath": "^0.10.8",
-    "node-fetch": "^3.3.2",
-    "node-pty": "^1.1.0-beta34",
     "postprocessing": "^6.39.4",
     "react": "19.2.6",
     "react-dom": "19.2.6",
-    "systeminformation": "^5.33.1",
-    "tailwind-merge": "3.4.0",
     "three": "^0.185.1",
     "ws": "^8.21.3"
   },
@@ -44,6 +38,7 @@
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "5.1.1",
+    "concurrently": "^9.2.4",
     "tailwindcss": "4.1.17",
     "typescript": "5.9.3",
     "vite": "7.3.2"
