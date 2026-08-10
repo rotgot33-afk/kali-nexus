@@ -459,44 +459,105 @@ wssTerminal.on('connection', (ws) => {
     try { spawnProcess && spawnProcess.kill(); } catch (e) {}
   };
 
-  // Use spawn as primary method (more reliable in containers than node-pty)
-  // node-pty has issues in some Docker environments where onData doesn't fire
+  // Command executor mode: receive commands via WebSocket, execute via exec
+  // More reliable than interactive shell in Docker containers
+  let currentCwd = os.homedir();
+  const username = os.userInfo().username;
+  const hostname = os.hostname();
+  const shortHost = hostname.split('-')[0];
+
   send(welcome + `\x1b[90m[Real Shell — commands execute on backend]\x1b[0m\r\n`);
-  try {
-    spawnProcess = spawn(shell, ['-i'], {
-      env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', PS1: '\\u@\\h:\\w# ' },
-      cwd: os.homedir(),
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+  send(`\r\n\x1b[32m${username}@${shortHost}\x1b[0m:\x1b[34m~\x1b[0m# `);
 
-    // Send a prompt trigger
-    setTimeout(() => { try { spawnProcess.stdin.write('\r'); } catch(e) {} }, 100);
+  let commandBuffer = '';
 
-    spawnProcess.stdout.on('data', (data) => {
-      send(data.toString());
-    });
-    spawnProcess.stderr.on('data', (data) => {
-      send(data.toString());
-    });
+  ws.on('message', async (msg) => {
+    try {
+      const text = msg.toString();
+      if (text === '__heartbeat__') return;
+      if (text.startsWith('\x1b[__resize__')) return;
 
-    ws.on('message', (msg) => {
-      try {
-        const text = msg.toString();
-        if (text.startsWith('\x1b[__resize__')) {
-          // spawn doesn't support resize, but we can ignore
-          return;
+      // Process each character
+      for (const ch of text) {
+        const code = ch.charCodeAt(0);
+        if (code === 13 || code === 10) {
+          // Enter — execute command
+          const cmd = commandBuffer.trim();
+          commandBuffer = '';
+          if (!cmd) {
+            send(`\r\n\x1b[32m${username}@${shortHost}\x1b[0m:\x1b[34m${currentCwd === os.homedir() ? '~' : currentCwd}\x1b[0m# `);
+            continue;
+          }
+
+          // Handle cd specially
+          if (cmd.startsWith('cd ')) {
+            const newDir = cmd.substring(3).trim();
+            try {
+              const targetPath = newDir === '~' ? os.homedir() : path.resolve(currentCwd, newDir);
+              process.chdir(targetPath);
+              currentCwd = targetPath;
+            } catch (e) {
+              send(`\r\nbash: cd: ${newDir}: No such file or directory\r\n`);
+            }
+            send(`\r\n\x1b[32m${username}@${shortHost}\x1b[0m:\x1b[34m${currentCwd === os.homedir() ? '~' : currentCwd}\x1b[0m# `);
+            continue;
+          }
+
+          // Handle clear
+          if (cmd === 'clear' || cmd === 'cls') {
+            send('\x1b[2J\x1b[H');
+            send(`\x1b[32m${username}@${shortHost}\x1b[0m:\x1b[34m${currentCwd === os.homedir() ? '~' : currentCwd}\x1b[0m# `);
+            continue;
+          }
+
+          // Handle exit
+          if (cmd === 'exit' || cmd === 'logout') {
+            send('\r\n\x1b[33m[Session ended]\x1b[0m\r\n');
+            ws.close();
+            return;
+          }
+
+          // Execute command
+          try {
+            const { stdout, stderr } = await execAsync(cmd, {
+              cwd: currentCwd,
+              timeout: 30000,
+              maxBuffer: 10 * 1024 * 1024,
+              env: { ...process.env, TERM: 'xterm-256color' },
+            });
+            if (stdout) send(stdout);
+            if (stderr) send(`\x1b[31m${stderr}\x1b[0m`);
+          } catch (error) {
+            if (error.stdout) send(error.stdout);
+            if (error.stderr) send(`\x1b[31m${error.stderr}\x1b[0m`);
+            else if (error.message) send(`\x1b[31m${error.message}\x1b[0m\r\n`);
+          }
+
+          send(`\r\n\x1b[32m${username}@${shortHost}\x1b[0m:\x1b[34m${currentCwd === os.homedir() ? '~' : currentCwd}\x1b[0m# `);
+        } else if (code === 3) {
+          // Ctrl+C
+          send('^C\r\n');
+          commandBuffer = '';
+          send(`\x1b[32m${username}@${shortHost}\x1b[0m:\x1b[34m${currentCwd === os.homedir() ? '~' : currentCwd}\x1b[0m# `);
+        } else if (code === 127 || code === 8) {
+          // Backspace
+          if (commandBuffer.length > 0) {
+            send('\b \b');
+            commandBuffer = commandBuffer.slice(0, -1);
+          }
+        } else if (code >= 32 && code < 127) {
+          // Printable character
+          send(ch);
+          commandBuffer += ch;
         }
-        if (text === '__heartbeat__') return;
-        spawnProcess.stdin.write(text);
-      } catch (e) {}
-    });
-    ws.on('close', () => { console.log('[Terminal] Client disconnected'); cleanup(); });
-    ws.on('error', () => { cleanup(); });
-    spawnProcess.on('exit', () => { try { if (alive) ws.close(); } catch (e) {} });
-    spawnProcess.on('error', (err) => { send(`\r\n\x1b[31m[shell error: ${err.message}]\x1b[0m\r\n`); });
-  } catch (e) {
-    send(`\r\n\x1b[31m[Failed to start shell: ${e.message}]\x1b[0m\r\n`);
-  }
+      }
+    } catch (e) {
+      console.error('[Terminal] Message error:', e.message);
+    }
+  });
+
+  ws.on('close', () => { console.log('[Terminal] Client disconnected'); cleanup(); });
+  ws.on('error', () => { cleanup(); });
 });
 
 // ============== WEBSOCKET: METASPLOIT CONSOLE ==============
