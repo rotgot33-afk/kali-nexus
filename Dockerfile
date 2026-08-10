@@ -9,14 +9,15 @@ WORKDIR /app
 
 # Install system dependencies needed for:
 # 1. node-pty compilation (build-essential + python3)
-# 2. Kali tools (nmap, tshark, tcpdump, metasploit, etc.)
+# 2. Kali tools (nmap, tshark, tcpdump, etc.)
 # 3. Common shell utilities
+# Note: metasploit-framework, nikto, hydra not in Debian repos — install separately
 RUN apt-get update && apt-get install -y --no-install-recommends \
       # Build tools for native Node modules
       build-essential \
       python3 \
       python3-dev \
-      # Kali tools
+      # Kali tools (available in Debian repos)
       nmap \
       tshark \
       tcpdump \
@@ -33,12 +34,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       wget \
       git \
       jq \
-      # Metasploit Framework (real msfconsole)
-      metasploit-framework \
-      # Additional security tools
+      # Security tools available in Debian
       sqlmap \
-      nikto \
-      hydra \
       # Shell & utilities
       bash \
       zsh \
@@ -54,10 +51,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       unzip \
       zip \
       ca-certificates \
-      # Python pip + tools
+      # Python pip + tools (for installing additional security tools)
       python3-pip \
       python3-venv \
+      # Ruby (for metasploit)
+      ruby \
+      ruby-dev \
+      ruby-bundler \
     && rm -rf /var/lib/apt/lists/*
+
+# Install additional security tools via pip/gem (not in Debian repos)
+RUN pip3 install --break-system-packages nikto 2>/dev/null || true
+RUN gem install metasploit-framework 2>/dev/null || echo "[WARN] metasploit gem install failed — use 'msfconsole' from Real Shell if available"
 
 # Set environment
 ENV DEBIAN_FRONTEND=noninteractive
