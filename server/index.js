@@ -463,10 +463,15 @@ wssTerminal.on('connection', (ws) => {
     try {
       ptyProcess = ptyModule.spawn(shell, [], {
         name: 'xterm-256color', cols: 80, rows: 24, cwd: os.homedir(),
-        env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
+        env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', PS1: '\\u@\\h:\\w# ' },
       });
-      send(welcome + `\x1b[90m[PTY mode — vim, top, htop, nano all work]\x1b[0m\r\n`);
+      // Set up onData handler IMMEDIATELY after spawn (before welcome message)
+      // to avoid race condition where bash prompt is lost
       ptyProcess.onData((data) => send(data));
+      // Small delay to let bash start, then send welcome
+      setTimeout(() => {
+        send(welcome + `\x1b[90m[PTY mode — vim, top, htop, nano all work]\x1b[0m\r\n`);
+      }, 100);
       ws.on('message', (msg) => {
         try {
           const text = msg.toString();
