@@ -6,7 +6,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { WebSocketServer } from 'ws';
-import { spawn, exec } from 'child_process';
+import { spawn, exec, execSync } from 'child_process';
 import http from 'http';
 import os from 'os';
 import fs from 'fs';
@@ -471,7 +471,7 @@ wssTerminal.on('connection', (ws) => {
 
   let commandBuffer = '';
 
-  ws.on('message', async (msg) => {
+  ws.on('message', (msg) => {
     try {
       const text = msg.toString();
       if (text === '__heartbeat__') return;
@@ -485,74 +485,69 @@ wssTerminal.on('connection', (ws) => {
           const cmd = commandBuffer.trim();
           commandBuffer = '';
           if (!cmd) {
-            send(`\r\n\x1b[32m${username}@${shortHost}\x1b[0m:\x1b[34m${currentCwd === os.homedir() ? '~' : currentCwd}\x1b[0m# `);
+            send(`\r\n${username}@${shortHost}:${currentCwd === os.homedir() ? '~' : currentCwd}# `);
             continue;
           }
 
-          // Handle cd specially
-          if (cmd.startsWith('cd ')) {
-            const newDir = cmd.substring(3).trim();
+          // Handle cd
+          if (cmd.startsWith('cd ') || cmd === 'cd') {
+            const newDir = cmd === 'cd' ? os.homedir() : cmd.substring(3).trim();
             try {
               const targetPath = newDir === '~' ? os.homedir() : path.resolve(currentCwd, newDir);
-              process.chdir(targetPath);
-              currentCwd = targetPath;
-            } catch (e) {
-              send(`\r\nbash: cd: ${newDir}: No such file or directory\r\n`);
-            }
-            send(`\r\n\x1b[32m${username}@${shortHost}\x1b[0m:\x1b[34m${currentCwd === os.homedir() ? '~' : currentCwd}\x1b[0m# `);
+              const stats = fs.statSync(targetPath);
+              if (stats.isDirectory()) { currentCwd = targetPath; }
+              else { send(`\r\nbash: cd: ${newDir}: Not a directory\r\n`); }
+            } catch (e) { send(`\r\nbash: cd: ${newDir}: No such file or directory\r\n`); }
+            send(`\r\n${username}@${shortHost}:${currentCwd === os.homedir() ? '~' : currentCwd}# `);
             continue;
           }
 
           // Handle clear
           if (cmd === 'clear' || cmd === 'cls') {
             send('\x1b[2J\x1b[H');
-            send(`\x1b[32m${username}@${shortHost}\x1b[0m:\x1b[34m${currentCwd === os.homedir() ? '~' : currentCwd}\x1b[0m# `);
+            send(`${username}@${shortHost}:${currentCwd === os.homedir() ? '~' : currentCwd}# `);
             continue;
           }
 
           // Handle exit
           if (cmd === 'exit' || cmd === 'logout') {
-            send('\r\n\x1b[33m[Session ended]\x1b[0m\r\n');
+            send('\r\n[Session ended]\r\n');
             ws.close();
             return;
           }
 
-          // Execute command
+          // Execute command using execSync (synchronous, reliable)
           try {
-            const { stdout, stderr } = await execAsync(cmd, {
+            const stdout = execSync(cmd, {
               cwd: currentCwd,
               timeout: 30000,
               maxBuffer: 10 * 1024 * 1024,
+              encoding: 'utf8',
               env: { ...process.env, TERM: 'xterm-256color' },
             });
             if (stdout) send(stdout);
-            if (stderr) send(`\x1b[31m${stderr}\x1b[0m`);
           } catch (error) {
-            if (error.stdout) send(error.stdout);
-            if (error.stderr) send(`\x1b[31m${error.stderr}\x1b[0m`);
-            else if (error.message) send(`\x1b[31m${error.message}\x1b[0m\r\n`);
+            if (error.stdout) send(error.stdout.toString());
+            if (error.stderr) send(error.stderr.toString());
+            else send(`\r\n${error.message}\r\n`);
           }
 
-          send(`\r\n\x1b[32m${username}@${shortHost}\x1b[0m:\x1b[34m${currentCwd === os.homedir() ? '~' : currentCwd}\x1b[0m# `);
+          send(`\r\n${username}@${shortHost}:${currentCwd === os.homedir() ? '~' : currentCwd}# `);
         } else if (code === 3) {
-          // Ctrl+C
-          send('^C\r\n');
+          send('^C');
           commandBuffer = '';
-          send(`\x1b[32m${username}@${shortHost}\x1b[0m:\x1b[34m${currentCwd === os.homedir() ? '~' : currentCwd}\x1b[0m# `);
+          send(`\r\n${username}@${shortHost}:${currentCwd === os.homedir() ? '~' : currentCwd}# `);
         } else if (code === 127 || code === 8) {
-          // Backspace
-          if (commandBuffer.length > 0) {
-            send('\b \b');
-            commandBuffer = commandBuffer.slice(0, -1);
-          }
+          if (commandBuffer.length > 0) { send('\b \b'); commandBuffer = commandBuffer.slice(0, -1); }
         } else if (code >= 32 && code < 127) {
-          // Printable character
           send(ch);
           commandBuffer += ch;
         }
       }
     } catch (e) {
-      console.error('[Terminal] Message error:', e.message);
+      console.error('[Terminal] Error:', e.message);
+      send(`\r\n[Error: ${e.message}]\r\n`);
+      send(`\r\n${username}@${shortHost}:${currentCwd === os.homedir() ? '~' : currentCwd}# `);
     }
   });
 
