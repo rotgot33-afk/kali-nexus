@@ -459,63 +459,44 @@ wssTerminal.on('connection', (ws) => {
     try { spawnProcess && spawnProcess.kill(); } catch (e) {}
   };
 
-  if (ptyModule) {
-    try {
-      ptyProcess = ptyModule.spawn(shell, [], {
-        name: 'xterm-256color', cols: 80, rows: 24, cwd: os.homedir(),
-        env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', PS1: '\\u@\\h:\\w# ' },
-      });
-      // Set up onData handler IMMEDIATELY after spawn (before welcome message)
-      // to avoid race condition where bash prompt is lost
-      ptyProcess.onData((data) => {
-        send(data);
-      });
-      // Send welcome message immediately (onData is already set up)
-      send(welcome + `\x1b[90m[PTY mode — vim, top, htop, nano all work]\x1b[0m\r\n`);
-      // Send a newline to trigger bash prompt
-      setTimeout(() => { try { ptyProcess.write('\r'); } catch(e) {} }, 200);
-      ws.on('message', (msg) => {
-        try {
-          const text = msg.toString();
-          if (text.startsWith('\x1b[__resize__')) {
-            const m = text.match(/cols=(\d+);rows=(\d+)/);
-            if (m && ptyProcess) { try { ptyProcess.resize(parseInt(m[1]), parseInt(m[2])); } catch (e) {} }
-            return;
-          }
-          // Ignore heartbeat messages from client
-          if (text === '__heartbeat__') return;
-          ptyProcess.write(text);
-        } catch (e) {}
-      });
-      ws.on('close', () => { console.log('[Terminal] Client disconnected (pty)'); cleanup(); });
-      ws.on('error', () => { cleanup(); });
-      ptyProcess.onExit(({ exitCode }) => { try { if (alive) ws.close(); } catch (e) {} console.log(`[Terminal] PTY exited with code ${exitCode}`); });
-      return;
-    } catch (e) { console.error('[PTY] Failed to spawn, falling back:', e.message); }
-  }
-
-  // ============ FALLBACK: child_process spawn ============
-  send(welcome + `\x1b[33m[spawn fallback mode — basic interactive shell]\x1b[0m\r\n`);
-  send(`\x1b[90m[vim/top may not work in fallback mode]\x1b[0m\r\n\r\n`);
+  // Use spawn as primary method (more reliable in containers than node-pty)
+  // node-pty has issues in some Docker environments where onData doesn't fire
+  send(welcome + `\x1b[90m[Real Shell — commands execute on backend]\x1b[0m\r\n`);
   try {
     spawnProcess = spawn(shell, ['-i'], {
       env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', PS1: '\\u@\\h:\\w# ' },
-      cwd: os.homedir(), stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: os.homedir(),
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
-    spawnProcess.stdout.on('data', (data) => send(data.toString()));
-    spawnProcess.stderr.on('data', (data) => send(data.toString()));
+
+    // Send a prompt trigger
+    setTimeout(() => { try { spawnProcess.stdin.write('\r'); } catch(e) {} }, 100);
+
+    spawnProcess.stdout.on('data', (data) => {
+      send(data.toString());
+    });
+    spawnProcess.stderr.on('data', (data) => {
+      send(data.toString());
+    });
+
     ws.on('message', (msg) => {
       try {
         const text = msg.toString();
+        if (text.startsWith('\x1b[__resize__')) {
+          // spawn doesn't support resize, but we can ignore
+          return;
+        }
         if (text === '__heartbeat__') return;
         spawnProcess.stdin.write(text);
       } catch (e) {}
     });
-    ws.on('close', () => { console.log('[Terminal] Client disconnected (spawn)'); cleanup(); });
+    ws.on('close', () => { console.log('[Terminal] Client disconnected'); cleanup(); });
     ws.on('error', () => { cleanup(); });
     spawnProcess.on('exit', () => { try { if (alive) ws.close(); } catch (e) {} });
     spawnProcess.on('error', (err) => { send(`\r\n\x1b[31m[shell error: ${err.message}]\x1b[0m\r\n`); });
-  } catch (e) { send(`\r\n\x1b[31m[Failed to start shell: ${e.message}]\x1b[0m\r\n`); }
+  } catch (e) {
+    send(`\r\n\x1b[31m[Failed to start shell: ${e.message}]\x1b[0m\r\n`);
+  }
 });
 
 // ============== WEBSOCKET: METASPLOIT CONSOLE ==============
