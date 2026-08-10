@@ -467,11 +467,13 @@ wssTerminal.on('connection', (ws) => {
       });
       // Set up onData handler IMMEDIATELY after spawn (before welcome message)
       // to avoid race condition where bash prompt is lost
-      ptyProcess.onData((data) => send(data));
-      // Small delay to let bash start, then send welcome
-      setTimeout(() => {
-        send(welcome + `\x1b[90m[PTY mode — vim, top, htop, nano all work]\x1b[0m\r\n`);
-      }, 100);
+      ptyProcess.onData((data) => {
+        send(data);
+      });
+      // Send welcome message immediately (onData is already set up)
+      send(welcome + `\x1b[90m[PTY mode — vim, top, htop, nano all work]\x1b[0m\r\n`);
+      // Send a newline to trigger bash prompt
+      setTimeout(() => { try { ptyProcess.write('\r'); } catch(e) {} }, 200);
       ws.on('message', (msg) => {
         try {
           const text = msg.toString();
