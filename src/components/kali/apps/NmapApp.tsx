@@ -53,9 +53,9 @@ export default function NmapApp() {
     setOutput('Initializing scan...\n');
     setScanMode(null);
 
-    // Try nmap first
+    // Try nmap first (server auto-adds --unprivileged for container compatibility)
     let res = await runNmap(target, profile);
-    if (res.success) {
+    if (res.success && res.stdout && res.stdout.length > 50) {
       setOutput(res.stdout);
       setResults(parseNmapOutput(res.stdout));
       setIsInstalled(true);
@@ -64,19 +64,23 @@ export default function NmapApp() {
       return;
     }
 
-    // nmap failed — check if it's because nmap is not installed
-    const isNotInstalled = res.stderr?.includes('not found') || res.stderr?.includes('not recognized') || res.stderr?.includes('nmap not found');
-    if (!isNotInstalled) {
-      // nmap exists but scan failed for another reason
-      setOutput(res.stdout || '');
-      setError(res.stderr || 'Scan failed');
-      setScanning(false);
-      return;
+    // nmap failed or returned empty results — always fall back to native scanner
+    const isNotInstalled = res.stderr?.includes('not found') || res.stderr?.includes('not recognized');
+    const isPermissionError = res.stderr?.includes('raw socket') || res.stderr?.includes('Operation not permitted');
+
+    if (isNotInstalled) {
+      setOutput((prev) => prev + '[*] nmap not installed — using native Node.js port scanner\n');
+    } else if (isPermissionError) {
+      setOutput((prev) => prev + '[*] nmap permission error — falling back to native scanner\n');
+      if (res.stdout) setOutput((prev) => prev + res.stdout + '\n');
+    } else {
+      setOutput((prev) => prev + '[*] nmap scan incomplete — using native scanner for reliable results\n');
+      if (res.stdout) setOutput((prev) => prev + res.stdout + '\n');
+      if (res.stderr) setOutput((prev) => prev + res.stderr + '\n');
     }
 
-    // Fall back to native Node.js scanner
+    // Always fall back to native Node.js scanner (works without CAP_NET_RAW)
     setIsInstalled(false);
-    setOutput((prev) => prev + '[*] nmap not installed — using native Node.js port scanner\n');
     setScanMode('native');
 
     try {

@@ -196,7 +196,7 @@ export default function TerminalApp() {
           onKeyDown={handleKey}
           className="flex-1 bg-transparent outline-none text-white caret-[#00ff41]"
           autoFocus
-          placeholder={suggestions.length ? '' : 'اكتب أمراً...'}
+          placeholder={suggestions.length ? '' : 'Enter command... (try: whoami, ls, nmap)'}
           spellCheck={false}
           autoComplete="off"
         />

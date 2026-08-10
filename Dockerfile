@@ -9,7 +9,7 @@ WORKDIR /app
 
 # Install system dependencies needed for:
 # 1. node-pty compilation (build-essential + python3)
-# 2. Kali tools (nmap, tshark, tcpdump, etc.)
+# 2. Kali tools (nmap, tshark, tcpdump, metasploit, etc.)
 # 3. Common shell utilities
 RUN apt-get update && apt-get install -y --no-install-recommends \
       # Build tools for native Node modules
@@ -33,6 +33,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       wget \
       git \
       jq \
+      # Metasploit Framework (real msfconsole)
+      metasploit-framework \
+      # Additional security tools
+      sqlmap \
+      nikto \
+      hydra \
       # Shell & utilities
       bash \
       zsh \

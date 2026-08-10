@@ -135,16 +135,16 @@ export default function AIAssistant({ onExecute }: { onExecute: (cmd: string) =>
             </div>
 
             {/* Input */}
-            <div className="p-3 border-t border-white/5 flex gap-2">
+            <form onSubmit={(e) => { e.preventDefault(); send(); }} className="p-3 border-t border-white/5 flex gap-2">
               <input
                 value={input}
                 onChange={e => setInput(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && send()}
                 placeholder="اكتب أمراً..."
                 className="flex-1 bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 outline-none text-white placeholder:text-white/30 text-[13px] focus:border-[#00ff41]/30"
+                autoFocus
               />
-              <button onClick={send} className="w-10 h-10 rounded-xl bg-[#00ff41] text-black flex items-center justify-center hover:bg-[#00ff41]/90 transition-colors">↑</button>
-            </div>
+              <button type="submit" className="w-10 h-10 rounded-xl bg-[#00ff41] text-black flex items-center justify-center hover:bg-[#00ff41]/90 transition-colors">↑</button>
+            </form>
           </motion.div>
         )}
       </AnimatePresence>

@@ -196,6 +196,11 @@ export default function RealTerminal() {
 
     // Connection attempt with longer timeout (Render free tier cold start)
     let connectionTimeout: ReturnType<typeof setTimeout> | null = null;
+    let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+    let reconnectAttempts = 0;
+    let isManualClose = false;
+
     const switchToDemo = () => {
       if (modeRef.current === 'connecting') {
         modeRef.current = 'demo';
@@ -204,17 +209,22 @@ export default function RealTerminal() {
       }
     };
 
-    try {
-      const ws = getTerminalWebSocket();
-      if (ws) {
+    const connect = () => {
+      try {
+        const ws = getTerminalWebSocket();
+        if (!ws) {
+          setTimeout(switchToDemo, 100);
+          return;
+        }
         wsRef.current = ws;
-        // 8-second timeout for Render cold start
-        connectionTimeout = setTimeout(switchToDemo, 8000);
+        // 15-second timeout for Render cold start
+        connectionTimeout = setTimeout(switchToDemo, 15000);
 
         ws.onopen = () => {
           if (connectionTimeout) clearTimeout(connectionTimeout);
           modeRef.current = 'connected';
           setMode('connected');
+          reconnectAttempts = 0;
           term.clear();
           // Send initial size
           setTimeout(() => {
@@ -223,27 +233,47 @@ export default function RealTerminal() {
               if (dims) sendResize(dims.cols, dims.rows);
             } catch (e) {}
           }, 100);
+
+          // Start heartbeat: send every 20s to keep connection alive
+          if (heartbeatInterval) clearInterval(heartbeatInterval);
+          heartbeatInterval = setInterval(() => {
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+              try { wsRef.current.send('__heartbeat__'); } catch (e) {}
+            }
+          }, 20000);
         };
         ws.onmessage = (event: MessageEvent) => {
           term.write(event.data);
         };
         ws.onerror = () => {};
         ws.onclose = () => {
-          if (modeRef.current === 'connected') {
+          if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
+
+          if (isManualClose) return;
+
+          // Auto-reconnect with exponential backoff (max 5 attempts)
+          if (reconnectAttempts < 5 && modeRef.current !== 'demo') {
+            reconnectAttempts++;
+            const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 10000);
+            term.writeln(`\r\n\x1b[33m⟳ Reconnecting in ${delay / 1000}s... (attempt ${reconnectAttempts}/5)\x1b[0m`);
+            modeRef.current = 'connecting';
+            setMode('connecting');
+            reconnectTimeout = setTimeout(() => connect(), delay);
+          } else if (modeRef.current === 'connected') {
             modeRef.current = 'demo';
             setMode('demo');
-            term.writeln('\r\n\x1b[33m⚠️  Disconnected - switched to demo mode\x1b[0m');
+            term.writeln('\r\n\x1b[33m⚠️  Connection lost - switched to demo mode\x1b[0m');
             term.write(PROMPT);
           } else {
             switchToDemo();
           }
         };
-      } else {
+      } catch (e) {
         setTimeout(switchToDemo, 100);
       }
-    } catch (e) {
-      setTimeout(switchToDemo, 100);
-    }
+    };
+
+    connect();
 
     // Resize handling — also sends new size to backend
     const handleResize = () => {
@@ -264,9 +294,12 @@ export default function RealTerminal() {
     resizeObserver.observe(containerRef.current);
 
     return () => {
+      isManualClose = true;
       window.removeEventListener('resize', handleResize);
       resizeObserver.disconnect();
       if (connectionTimeout) clearTimeout(connectionTimeout);
+      if (heartbeatInterval) clearInterval(heartbeatInterval);
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
       try { wsRef.current?.close(); } catch (e) {}
       term.dispose();
     };

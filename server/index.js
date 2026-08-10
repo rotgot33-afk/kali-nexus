@@ -196,17 +196,27 @@ app.post('/api/fs/write', async (req, res) => {
   catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// ============== NMAP ==============
+// ============== NMAP (auto-adds --unprivileged for container compatibility) ==============
 app.post('/api/nmap', async (req, res) => {
   const { target, options = '-sV' } = req.body;
   if (!target) return res.status(400).json({ error: 'No target' });
   const safeTarget = target.replace(/[^a-zA-Z0-9.\-/:]/g, '');
-  const safeOptions = options.replace(/[^a-zA-Z0-9\-\s]/g, '');
+  let safeOptions = options.replace(/[^a-zA-Z0-9\-\s]/g, '').trim();
+  // Auto-add --unprivileged if not present (containers don't have CAP_NET_RAW)
+  if (!safeOptions.includes('--unprivileged')) {
+    safeOptions += ' --unprivileged';
+  }
   const command = `nmap ${safeOptions} ${safeTarget}`;
   try {
     const { stdout, stderr } = await execAsync(command, { timeout: 60000 });
     res.json({ success: true, stdout, stderr, command });
-  } catch (error) { res.json({ success: false, stdout: error.stdout || '', stderr: error.stderr || 'nmap not found.', command }); }
+  } catch (error) {
+    // If nmap still fails (e.g., not installed), fall back to native scanner
+    if ((error.stderr || '').includes('not found') || (error.message || '').includes('not found')) {
+      return res.json({ success: false, stdout: '', stderr: 'nmap not installed. Using native scanner.', command, fallback: true });
+    }
+    res.json({ success: false, stdout: error.stdout || '', stderr: error.stderr || error.message, command });
+  }
 });
 
 // ============== PING ==============
@@ -416,15 +426,38 @@ wssTerminal.on('connection', (ws) => {
   let ptyProcess = null;
   let spawnProcess = null;
   let alive = true;
+  let heartbeatInterval = null;
 
   const send = (data) => {
     try { if (alive) ws.send(typeof data === 'string' ? data : data.toString(), { binary: false }); } catch (e) {}
   };
 
+  // Heartbeat: send ping every 25s to keep connection alive (Render proxy kills idle after ~30s)
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  heartbeatInterval = setInterval(() => {
+    if (!alive) return;
+    if (ws.isAlive === false) {
+      console.log('[Terminal] Heartbeat timeout, terminating connection');
+      try { ws.terminate(); } catch (e) {}
+      return;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch (e) {}
+  }, 25000);
+
   const welcome = `\r\n\x1b[32m╔════════════════════════════════════════╗\r\n║   🐉 KALI NEXUS — REAL SHELL           ║\r\n╚════════════════════════════════════════╝\x1b[0m\r\n` +
     `\r\nHost: ${os.hostname()} • ${os.platform()} ${os.release()}\r\n` +
     `User: ${os.userInfo().username} • Shell: ${shell}\r\n` +
     `Cwd:  ${os.homedir()}\r\n\r\n`;
+
+  const cleanup = () => {
+    alive = false;
+    if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
+    try { ptyProcess && ptyProcess.kill(); } catch (e) {}
+    try { spawnProcess && spawnProcess.kill(); } catch (e) {}
+  };
 
   if (ptyModule) {
     try {
@@ -442,10 +475,13 @@ wssTerminal.on('connection', (ws) => {
             if (m && ptyProcess) { try { ptyProcess.resize(parseInt(m[1]), parseInt(m[2])); } catch (e) {} }
             return;
           }
+          // Ignore heartbeat messages from client
+          if (text === '__heartbeat__') return;
           ptyProcess.write(text);
         } catch (e) {}
       });
-      ws.on('close', () => { alive = false; try { ptyProcess && ptyProcess.kill(); } catch (e) {} console.log('[Terminal] Client disconnected (pty)'); });
+      ws.on('close', () => { console.log('[Terminal] Client disconnected (pty)'); cleanup(); });
+      ws.on('error', () => { cleanup(); });
       ptyProcess.onExit(({ exitCode }) => { try { if (alive) ws.close(); } catch (e) {} console.log(`[Terminal] PTY exited with code ${exitCode}`); });
       return;
     } catch (e) { console.error('[PTY] Failed to spawn, falling back:', e.message); }
@@ -461,8 +497,15 @@ wssTerminal.on('connection', (ws) => {
     });
     spawnProcess.stdout.on('data', (data) => send(data.toString()));
     spawnProcess.stderr.on('data', (data) => send(data.toString()));
-    ws.on('message', (msg) => { try { spawnProcess.stdin.write(msg.toString()); } catch (e) {} });
-    ws.on('close', () => { alive = false; try { spawnProcess && spawnProcess.kill(); } catch (e) {} console.log('[Terminal] Client disconnected (spawn)'); });
+    ws.on('message', (msg) => {
+      try {
+        const text = msg.toString();
+        if (text === '__heartbeat__') return;
+        spawnProcess.stdin.write(text);
+      } catch (e) {}
+    });
+    ws.on('close', () => { console.log('[Terminal] Client disconnected (spawn)'); cleanup(); });
+    ws.on('error', () => { cleanup(); });
     spawnProcess.on('exit', () => { try { if (alive) ws.close(); } catch (e) {} });
     spawnProcess.on('error', (err) => { send(`\r\n\x1b[31m[shell error: ${err.message}]\x1b[0m\r\n`); });
   } catch (e) { send(`\r\n\x1b[31m[Failed to start shell: ${e.message}]\x1b[0m\r\n`); }
@@ -514,47 +557,128 @@ const wssShark = new WebSocketServer({ server, path: '/wireshark', perMessageDef
 wssShark.on('connection', (ws) => {
   console.log('[Wireshark] Client connected');
   let alive = true;
-  let tsharkProcess = null;
+  let captureProcess = null;
+  let packetCount = 0;
   const send = (data) => { try { if (alive) ws.send(typeof data === 'string' ? data : data.toString(), { binary: false }); } catch (e) {} };
 
+  // Parse tcpdump output line into structured packet data
+  const parseTcpdumpLine = (line) => {
+    // Example: "10:30:45.123456 IP 192.168.1.1.443 > 192.168.1.2.54321: Flags [S], seq 0, win 64240, length 0"
+    const match = line.match(/^(\d+:\d+:\d+\.\d+)\s+IP\s+(\S+)\s+>\s+(\S+):\s+(.*)$/);
+    if (!match) return null;
+    const [, time, srcFull, dstFull, info] = match;
+    const src = srcFull.replace(/\.\d+$/, ''); // strip port
+    const dst = dstFull.replace(/\.\d+$/, '');
+    let proto = 'IP';
+    if (info.includes('Flags [S]')) proto = 'TCP';
+    else if (info.includes('UDP')) proto = 'UDP';
+    else if (info.includes('ICMP')) proto = 'ICMP';
+    else if (srcFull.includes('.53') || dstFull.includes('.53')) proto = 'DNS';
+    else if (srcFull.includes('.80') || dstFull.includes('.80')) proto = 'HTTP';
+    else if (srcFull.includes('.443') || dstFull.includes('.443')) proto = 'HTTPS';
+    else if (info.includes('ARP')) proto = 'ARP';
+    const lenMatch = info.match(/length\s+(\d+)/);
+    const len = lenMatch ? lenMatch[1] : '0';
+    return { time, src, dst, proto, len, info: info.substring(0, 100) };
+  };
+
   const startCapture = (iface = 'any', filter = '') => {
-    send(`\x1b[33m[*] Starting tshark on ${iface}${filter ? ' filter: ' + filter : ''}\x1b[0m\r\n`);
-    const args = ['-l', '-i', iface, '-T', 'fields',
+    send(JSON.stringify({ type: 'status', text: `Starting capture on ${iface}...` }) + '\n');
+    // Use tcpdump with line-buffered output (-l), no name resolution (-n), no timestamps conversion (-tt)
+    // -i: interface, -q: quiet (one line per packet), -s 0: full capture
+    const args = ['-l', '-n', '-q', '-tt'];
+    if (iface && iface !== 'any') {
+      args.push('-i', iface);
+    }
+    if (filter) args.push(filter);
+
+    try {
+      captureProcess = spawn('tcpdump', args, { env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+      send(JSON.stringify({ type: 'status', text: 'Capture started (tcpdump live)' }) + '\n');
+
+      captureProcess.stdout.on('data', (data) => {
+        const lines = data.toString().split('\n').filter(l => l.trim());
+        for (const line of lines) {
+          packetCount++;
+          const parsed = parseTcpdumpLine(line);
+          if (parsed) {
+            send(JSON.stringify({
+              type: 'packet',
+              no: String(packetCount),
+              time: parsed.time,
+              src: parsed.src,
+              dst: parsed.dst,
+              proto: parsed.proto,
+              len: parsed.len,
+              info: parsed.info,
+            }) + '\n');
+          }
+        }
+      });
+      captureProcess.stderr.on('data', (data) => {
+        const text = data.toString();
+        // tcpdump prints "listening on..." and "X packets captured" to stderr
+        if (text.includes('listening')) {
+          send(JSON.stringify({ type: 'status', text: text.trim() }) + '\n');
+        } else if (text.includes('packets captured') || text.includes('packets received')) {
+          send(JSON.stringify({ type: 'status', text: text.trim() }) + '\n');
+        } else {
+          send(JSON.stringify({ type: 'stderr', text }) + '\n');
+        }
+      });
+      captureProcess.on('exit', (code) => send(JSON.stringify({ type: 'exit', code }) + '\n'));
+      captureProcess.on('error', (err) => {
+        send(JSON.stringify({ type: 'error', text: `tcpdump error: ${err.message}` }) + '\n');
+        // Fallback: try tshark
+        send(JSON.stringify({ type: 'status', text: 'Trying tshark fallback...' }) + '\n');
+        startTshark(iface, filter);
+      });
+    } catch (e) {
+      send(JSON.stringify({ type: 'error', text: e.message }) + '\n');
+    }
+  };
+
+  const startTshark = (iface, filter) => {
+    const args = ['-l', '-i', iface || 'any', '-T', 'fields',
       '-e', 'frame.number', '-e', 'frame.time_relative',
       '-e', 'ip.src', '-e', 'ip.dst', '-e', '_ws.col.Protocol',
       '-e', 'frame.len', '-e', '_ws.col.Info'];
     if (filter) args.push('-f', filter);
     try {
-      tsharkProcess = spawn('tshark', args, { env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
-      tsharkProcess.stdout.on('data', (data) => {
+      captureProcess = spawn('tshark', args, { env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+      captureProcess.stdout.on('data', (data) => {
         const lines = data.toString().split('\n').filter(l => l.trim());
         for (const line of lines) {
+          packetCount++;
           const fields = line.split('\t');
           send(JSON.stringify({
-            type: 'packet', no: fields[0] || '', time: fields[1] || '',
+            type: 'packet', no: String(packetCount), time: fields[1] || '',
             src: fields[2] || '', dst: fields[3] || '', proto: fields[4] || '',
             len: fields[5] || '', info: fields[6] || '',
           }) + '\n');
         }
       });
-      tsharkProcess.stderr.on('data', (data) => send(JSON.stringify({ type: 'stderr', text: data.toString() }) + '\n'));
-      tsharkProcess.on('exit', (code) => send(JSON.stringify({ type: 'exit', code }) + '\n'));
-      tsharkProcess.on('error', (err) => send(JSON.stringify({ type: 'error', text: err.message }) + '\n'));
+      captureProcess.stderr.on('data', (data) => send(JSON.stringify({ type: 'stderr', text: data.toString() }) + '\n'));
+      captureProcess.on('exit', (code) => send(JSON.stringify({ type: 'exit', code }) + '\n'));
+      captureProcess.on('error', () => {
+        send(JSON.stringify({ type: 'error', text: 'Neither tcpdump nor tshark available. Using demo mode.' }) + '\n');
+        send(JSON.stringify({ type: 'demo' }) + '\n');
+      });
     } catch (e) { send(JSON.stringify({ type: 'error', text: e.message }) + '\n'); }
   };
 
   ws.on('message', (msg) => {
     try {
       const data = JSON.parse(msg.toString());
-      if (data.type === 'start') startCapture(data.iface || 'any', data.filter || '');
-      else if (data.type === 'stop') { try { tsharkProcess && tsharkProcess.kill('SIGINT'); } catch (e) {} }
+      if (data.type === 'start') { packetCount = 0; startCapture(data.iface || 'any', data.filter || ''); }
+      else if (data.type === 'stop') { try { captureProcess && captureProcess.kill('SIGINT'); } catch (e) {} }
     } catch (e) {}
   });
 
   ws.on('close', () => {
     alive = false;
-    try { tsharkProcess && tsharkProcess.kill('SIGINT'); } catch (e) {}
-    setTimeout(() => { try { tsharkProcess && tsharkProcess.kill(); } catch (e) {} }, 300);
+    try { captureProcess && captureProcess.kill('SIGINT'); } catch (e) {}
+    setTimeout(() => { try { captureProcess && captureProcess.kill(); } catch (e) {} }, 300);
     console.log('[Wireshark] Client disconnected');
   });
 });

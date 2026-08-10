@@ -116,25 +116,33 @@ export default function WiresharkApp() {
               color: PROTOCOL_COLORS[data.proto?.toUpperCase()] || '#ffffff',
             };
             setPackets((prev) => [...prev.slice(-100), newPkt]);
+          } else if (data.type === 'status') {
+            // Status messages from tcpdump (e.g., "listening on eth0")
+            // Don't switch to demo mode on status messages
           } else if (data.type === 'stderr') {
-            // tshark permission error → demo mode
-            if (data.text.includes('Permission denied') || data.text.includes('CAP_NET_RAW')) {
+            // Check for permission errors
+            if (data.text.includes('Permission denied') || data.text.includes('CAP_NET_RAW') || data.text.includes('You don\'t have permission')) {
               setMode('demo');
               try { ws.close(); } catch (e) {}
             }
+          } else if (data.type === 'demo') {
+            // Server explicitly told us to use demo mode
+            setMode('demo');
           } else if (data.type === 'exit') {
             setCapturing(false);
+            // Don't switch to demo on exit if we already have packets
             if (mode === 'live' && packets.length === 0) setMode('demo');
           }
         } catch (e) {}
       };
       ws.onerror = () => {
         clearTimeout(timeout);
-        setMode('demo');
+        // Don't immediately switch to demo on error - let onclose handle it
       };
       ws.onclose = () => {
         clearTimeout(timeout);
-        if (mode === 'idle' || mode === 'live') setMode('demo');
+        // Only switch to demo if we never connected
+        if (mode === 'idle') setMode('demo');
       };
     } catch (e) {
       setMode('demo');
