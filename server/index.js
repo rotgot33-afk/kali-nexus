@@ -420,139 +420,65 @@ const wssTerminal = new WebSocketServer({ server, path: '/terminal', perMessageD
 
 wssTerminal.on('connection', (ws) => {
   console.log('[Terminal] Client connected');
-  const isWin = os.platform() === 'win32';
-  const shell = isWin ? 'powershell.exe' : (process.env.SHELL || '/bin/bash' || 'sh');
-
-  let ptyProcess = null;
-  let spawnProcess = null;
-  let alive = true;
-  let heartbeatInterval = null;
-
-  const send = (data) => {
-    try { if (alive) ws.send(typeof data === 'string' ? data : data.toString(), { binary: false }); } catch (e) {}
-  };
-
-  // Heartbeat: send ping every 25s to keep connection alive (Render proxy kills idle after ~30s)
-  ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
-
-  heartbeatInterval = setInterval(() => {
-    if (!alive) return;
-    if (ws.isAlive === false) {
-      console.log('[Terminal] Heartbeat timeout, terminating connection');
-      try { ws.terminate(); } catch (e) {}
-      return;
-    }
-    ws.isAlive = false;
-    try { ws.ping(); } catch (e) {}
-  }, 25000);
-
-  const welcome = `\r\n\x1b[32m╔════════════════════════════════════════╗\r\n║   🐉 KALI NEXUS — REAL SHELL           ║\r\n╚════════════════════════════════════════╝\x1b[0m\r\n` +
-    `\r\nHost: ${os.hostname()} • ${os.platform()} ${os.release()}\r\n` +
-    `User: ${os.userInfo().username} • Shell: ${shell}\r\n` +
-    `Cwd:  ${os.homedir()}\r\n\r\n`;
-
-  const cleanup = () => {
-    alive = false;
-    if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
-    try { ptyProcess && ptyProcess.kill(); } catch (e) {}
-    try { spawnProcess && spawnProcess.kill(); } catch (e) {}
-  };
-
-  // Command executor mode: receive commands via WebSocket, execute via exec
-  // More reliable than interactive shell in Docker containers
+  const shell = process.env.SHELL || '/bin/bash';
   let currentCwd = os.homedir();
   const username = os.userInfo().username;
-  const hostname = os.hostname();
-  const shortHost = hostname.split('-')[0];
-
-  send(welcome + `\x1b[90m[Real Shell — commands execute on backend]\x1b[0m\r\n`);
-  send(`\r\n\x1b[32m${username}@${shortHost}\x1b[0m:\x1b[34m~\x1b[0m# `);
+  const shortHost = os.hostname().split('-')[0].substring(0, 20);
+  const getPrompt = () => `${username}@${shortHost}:${currentCwd === os.homedir() ? '~' : currentCwd}# `;
 
   let commandBuffer = '';
 
+  // Set up message handler FIRST, before sending any data
   ws.on('message', (msg) => {
-    try {
-      const text = msg.toString();
-      if (text === '__heartbeat__') return;
-      if (text.startsWith('\x1b[__resize__')) return;
+    const text = msg.toString();
+    console.log('[Terminal] Received:', JSON.stringify(text.substring(0, 30)));
 
-      // Process each character
-      for (const ch of text) {
-        const code = ch.charCodeAt(0);
-        if (code === 13 || code === 10) {
-          // Enter — execute command
-          const cmd = commandBuffer.trim();
-          commandBuffer = '';
-          if (!cmd) {
-            send(`\r\n${username}@${shortHost}:${currentCwd === os.homedir() ? '~' : currentCwd}# `);
-            continue;
-          }
+    for (const ch of text) {
+      const code = ch.charCodeAt(0);
+      if (code === 13 || code === 10) {
+        const cmd = commandBuffer.trim();
+        commandBuffer = '';
+        if (!cmd) { ws.send('\r\n' + getPrompt()); continue; }
 
-          // Handle cd
-          if (cmd.startsWith('cd ') || cmd === 'cd') {
-            const newDir = cmd === 'cd' ? os.homedir() : cmd.substring(3).trim();
-            try {
-              const targetPath = newDir === '~' ? os.homedir() : path.resolve(currentCwd, newDir);
-              const stats = fs.statSync(targetPath);
-              if (stats.isDirectory()) { currentCwd = targetPath; }
-              else { send(`\r\nbash: cd: ${newDir}: Not a directory\r\n`); }
-            } catch (e) { send(`\r\nbash: cd: ${newDir}: No such file or directory\r\n`); }
-            send(`\r\n${username}@${shortHost}:${currentCwd === os.homedir() ? '~' : currentCwd}# `);
-            continue;
-          }
-
-          // Handle clear
-          if (cmd === 'clear' || cmd === 'cls') {
-            send('\x1b[2J\x1b[H');
-            send(`${username}@${shortHost}:${currentCwd === os.homedir() ? '~' : currentCwd}# `);
-            continue;
-          }
-
-          // Handle exit
-          if (cmd === 'exit' || cmd === 'logout') {
-            send('\r\n[Session ended]\r\n');
-            ws.close();
-            return;
-          }
-
-          // Execute command using execSync (synchronous, reliable)
+        if (cmd.startsWith('cd ') || cmd === 'cd') {
+          const newDir = cmd === 'cd' ? os.homedir() : cmd.substring(3).trim();
           try {
-            const stdout = execSync(cmd, {
-              cwd: currentCwd,
-              timeout: 30000,
-              maxBuffer: 10 * 1024 * 1024,
-              encoding: 'utf8',
-              env: { ...process.env, TERM: 'xterm-256color' },
-            });
-            if (stdout) send(stdout);
-          } catch (error) {
-            if (error.stdout) send(error.stdout.toString());
-            if (error.stderr) send(error.stderr.toString());
-            else send(`\r\n${error.message}\r\n`);
-          }
-
-          send(`\r\n${username}@${shortHost}:${currentCwd === os.homedir() ? '~' : currentCwd}# `);
-        } else if (code === 3) {
-          send('^C');
-          commandBuffer = '';
-          send(`\r\n${username}@${shortHost}:${currentCwd === os.homedir() ? '~' : currentCwd}# `);
-        } else if (code === 127 || code === 8) {
-          if (commandBuffer.length > 0) { send('\b \b'); commandBuffer = commandBuffer.slice(0, -1); }
-        } else if (code >= 32 && code < 127) {
-          send(ch);
-          commandBuffer += ch;
+            const targetPath = newDir === '~' ? os.homedir() : path.resolve(currentCwd, newDir);
+            if (fs.statSync(targetPath).isDirectory()) currentCwd = targetPath;
+            else ws.send(`\r\ncd: ${newDir}: Not a directory\r\n`);
+          } catch (e) { ws.send(`\r\ncd: ${newDir}: No such file or directory\r\n`); }
+          ws.send('\r\n' + getPrompt());
+          continue;
         }
+
+        if (cmd === 'clear') { ws.send('\x1b[2J\x1b[H' + getPrompt()); continue; }
+        if (cmd === 'exit') { ws.send('\r\n[Session ended]\r\n'); ws.close(); return; }
+
+        try {
+          const stdout = execSync(cmd, { cwd: currentCwd, timeout: 30000, maxBuffer: 10*1024*1024, encoding: 'utf8' });
+          if (stdout) ws.send(stdout);
+        } catch (error) {
+          if (error.stdout) ws.send(error.stdout.toString());
+          if (error.stderr) ws.send(error.stderr.toString());
+          else ws.send(`\r\n${error.message}\r\n`);
+        }
+        ws.send('\r\n' + getPrompt());
+      } else if (code === 3) {
+        ws.send('^C'); commandBuffer = ''; ws.send('\r\n' + getPrompt());
+      } else if (code === 127 || code === 8) {
+        if (commandBuffer.length > 0) { ws.send('\b \b'); commandBuffer = commandBuffer.slice(0, -1); }
+      } else if (code >= 32 && code < 127) {
+        ws.send(ch); commandBuffer += ch;
       }
-    } catch (e) {
-      console.error('[Terminal] Error:', e.message);
-      send(`\r\n[Error: ${e.message}]\r\n`);
-      send(`\r\n${username}@${shortHost}:${currentCwd === os.homedir() ? '~' : currentCwd}# `);
     }
   });
 
-  ws.on('close', () => { console.log('[Terminal] Client disconnected'); cleanup(); });
-  ws.on('error', () => { cleanup(); });
+  ws.on('close', () => { console.log('[Terminal] Client disconnected'); });
+  ws.on('error', (err) => { console.error('[Terminal] WS error:', err.message); });
+
+  // Send welcome AFTER handlers are set up
+  ws.send(`\r\nKALI NEXUS - REAL SHELL\r\nHost: ${os.hostname()}\r\nUser: ${username}\r\nCwd: ${currentCwd}\r\n\r\n`);
+  ws.send(getPrompt());
 });
 
 // ============== WEBSOCKET: METASPLOIT CONSOLE ==============
